@@ -47,13 +47,51 @@ Optionally drop Meera's actual published posts into `voice_reference/` as
 `.txt` files (see that folder's README) - without them the bot still runs,
 just with looser voice matching.
 
-Run it:
+Run it locally (polling):
 
 ```bash
 python main.py
 ```
 
 Post a note in the channel and watch for the reply.
+
+## Deploying to Vercel
+
+Vercel runs serverless functions, not long-running processes, so this uses a
+**webhook** ([api/webhook.py](api/webhook.py)) instead of `bot.py`'s polling
+loop - Telegram pushes each channel post to the deployed URL directly.
+
+1. **Import the repo into Vercel** (vercel.com -> New Project -> this repo).
+   No build settings needed - `vercel.json` and `requirements.txt` at the
+   repo root are picked up automatically.
+2. **Set environment variables** in the Vercel project (Settings ->
+   Environment Variables): `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`,
+   `GEMINI_API_KEY`, `GEMINI_MODEL`, `SERPER_API_KEY` - same values as your
+   local `.env`.
+3. **Deploy**, then point Telegram at the deployed URL:
+
+   ```bash
+   curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://<your-project>.vercel.app/api/webhook"
+   ```
+
+4. Post a note in the channel - Telegram calls the webhook directly, no
+   polling process needed.
+
+**Known limitation on Vercel:** the filesystem is read-only outside `/tmp`,
+and `/tmp` isn't guaranteed to persist between invocations. `config.py`
+detects `VERCEL=1` (set automatically by Vercel) and points storage at
+`/tmp` so it mostly works within a warm container, but the recent-topics
+dedupe and note/draft history are **best-effort, not reliably persistent**
+in this deployment - a cold start can lose them. For real persistence, swap
+`storage.py` for an external store (Upstash Redis's REST API is a small,
+serverless-friendly fit) rather than flat files.
+
+To go back to polling mode (e.g. to debug locally), call `deleteWebhook`
+first - Telegram only allows one delivery method at a time:
+
+```bash
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/deleteWebhook"
+```
 
 ## Project layout
 
@@ -65,10 +103,13 @@ services/
                         reference curation, draft
   search.py             Serper news search wrapper
 pipeline.py             Orchestrates trigger -> ... -> output for one note
-bot.py                  Telegram handler: receives notes, sends replies
-main.py                 Entrypoint
+reply_format.py         Turns a pipeline result into the reply text (shared)
+bot.py                  Local dev entrypoint: long-polling handler
+main.py                 Local dev entrypoint
+api/webhook.py          Vercel entrypoint: webhook handler (Flask/WSGI)
+vercel.json             Vercel function config (maxDuration)
 voice_reference/        Meera's own writing, used as few-shot voice examples
-data/                   notes.json, drafts.json (created on first run)
+data/                   notes.json, drafts.json (created on first run, local only)
 ```
 
 ## Known simplifications

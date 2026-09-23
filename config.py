@@ -17,7 +17,13 @@ GEMINI_MODEL = _clean(os.environ.get("GEMINI_MODEL")) or "gemini-3.6-flash"
 SERPER_API_KEY = _clean(os.environ.get("SERPER_API_KEY"))
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+IS_SERVERLESS = bool(os.environ.get("VERCEL"))
+# Vercel's filesystem is read-only per invocation except /tmp, and /tmp isn't
+# guaranteed to survive between invocations - so on Vercel, note history and
+# the recent-topics dedupe are best-effort within a warm container, not
+# reliably persistent. Fine for demo purposes; swap for a real store (e.g.
+# Upstash Redis) if that dedupe needs to actually hold across deploys.
+DATA_DIR = Path("/tmp/skinstinct_data") if IS_SERVERLESS else BASE_DIR / "data"
 NOTES_FILE = DATA_DIR / "notes.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 VOICE_REFERENCE_DIR = BASE_DIR / "voice_reference"
