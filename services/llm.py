@@ -1,5 +1,7 @@
-"""The AI step of the pipeline: triage a raw note, generate search queries,
-curate the best current reference, then draft the post."""
+"""The AI steps of the pipeline: transcribe a voice note, score it for
+publishability, generate search queries, curate the best news hook, then
+draft the post in Meera's voice."""
+import base64
 import json
 import re
 
@@ -14,27 +16,31 @@ class LLMError(Exception):
     pass
 
 
-def _call_json(system, user_content, max_tokens=1200):
+def _generate(system, parts, max_tokens, temperature, json_mode):
     if not config.GEMINI_API_KEY:
         raise LLMError("GEMINI_API_KEY is not set.")
 
-    url = _GEMINI_URL.format(model=config.GEMINI_MODEL)
+    generation_config = {
+        "temperature": temperature,
+        "maxOutputTokens": max_tokens,
+        # gemini-3.6-flash thinks by default, and thinking tokens count against
+        # maxOutputTokens - left on, it truncates the JSON before it closes.
+        "thinkingConfig": {"thinkingBudget": 0},
+    }
+    if json_mode:
+        generation_config["responseMimeType"] = "application/json"
+
     payload = {
         "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": user_content}]}],
-        "generationConfig": {
-            "temperature": 0.4,
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json",
-            "thinkingConfig": {"thinkingBudget": 0},
-        },
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": generation_config,
     }
     try:
         resp = requests.post(
-            url,
+            _GEMINI_URL.format(model=config.GEMINI_MODEL),
             params={"key": config.GEMINI_API_KEY},
             json=payload,
-            timeout=30,
+            timeout=45,
         )
         resp.raise_for_status()
         data = resp.json()
@@ -42,13 +48,16 @@ def _call_json(system, user_content, max_tokens=1200):
         raise LLMError(f"Gemini API request failed: {exc}") from exc
 
     try:
-        parts = data["candidates"][0]["content"]["parts"]
-        raw_text = "".join(p.get("text", "") for p in parts).strip()
+        raw_text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
     except (KeyError, IndexError):
         raw_text = ""
     if not raw_text:
         raise LLMError(f"Gemini returned an empty response: {data}")
+    return raw_text
 
+
+def _call_json(system, user_content, max_tokens=1200, temperature=0.3):
+    raw_text = _generate(system, [{"text": user_content}], max_tokens, temperature, json_mode=True)
     try:
         return json.loads(raw_text)
     except json.JSONDecodeError:
@@ -61,52 +70,72 @@ def _call_json(system, user_content, max_tokens=1200):
             raise LLMError(f"Gemini returned unparseable output: {raw_text[:300]}")
 
 
-TRIAGE_SYSTEM = """You are triaging raw content fragments for Meera Pillai, founder of Skinstinct \
-(D2C skincare, minimal-ingredient formulations). Meera has a pharma background - she talks in \
-actives, concentrations, pH, and clinical trial data, never vague wellness language. Her audience \
-is 28-40 year old urban women who are skeptical of being sold to.
+TRANSCRIBE_SYSTEM = """Transcribe this voice note verbatim. It is a skincare founder talking to \
+herself - expect ingredient names (niacinamide, ascorbic acid, ceramide NP, bakuchiol...), pH \
+values, percentages, and Indian place names; spell them correctly. Drop filler sounds (um, uh) \
+but keep every substantive word. Output only the transcript, no preamble."""
 
-You will be given ONE raw fragment (a voice-note transcript or a short written note). Decide \
-whether it has enough substance to become a LinkedIn post.
 
-A fragment is WORTH DEVELOPING if it has at least one of:
-- A specific claim, number, or mechanism (an ingredient %, a pH value, a manufacturing detail, a \
-customer behavior pattern)
-- A clear point of view or contrarian take (e.g. "the % on the label doesn't matter")
-- A concrete anecdote from the manufacturing unit or a customer DM
+def transcribe_audio(audio_bytes, mime_type):
+    parts = [
+        {"inline_data": {"mime_type": mime_type, "data": base64.b64encode(audio_bytes).decode()}},
+        {"text": "Transcribe this voice note."},
+    ]
+    return _generate(TRANSCRIBE_SYSTEM, parts, max_tokens=2000, temperature=0.0, json_mode=False)
 
-A fragment is NOT worth developing if it is:
-- A mood/feeling with no specific claim ("today was exhausting")
-- A fragment of a fragment (too short/vague to reconstruct intent)
-- A duplicate of a theme already drafted in the last 14 days (a list of recent topics is given - \
-check against it)
+
+TRIAGE_SYSTEM = """You score raw content notes for Meera Pillai, founder of Skinstinct (D2C \
+skincare, minimal-ingredient formulations, Mumbai). She has a pharma formulation background and \
+writes long, precise LinkedIn posts about formulation science, ingredient deep-dives, industry \
+transparency, India-specific skincare context, and her founder story. Her audience is 28-40 year \
+old urban women who are tired of being sold to.
+
+You get ONE raw note (a voice-note transcript or a quick typed thought). Score how publishable it \
+is as the seed of a 400-550 word LinkedIn post in her voice, from 0 to 10.
+
+Score = sum of:
+- Specificity (0-3): a number, a mechanism, a named ingredient or pH, a concrete manufacturing \
+detail, a real customer DM or return pattern. 0 if it's all feeling, no substance.
+- Point of view (0-3): a claim she'd defend, a misconception it corrects, a gap between what \
+labels say and what the chemistry does.
+- Fit (0-2): sits in one of her pillars - Ingredient Deep-Dive, Formulation Science, \
+India-Specific Context, Industry Transparency, Founder Story, Consumer Education, Brand Philosophy.
+- Enough to build on (0-2): could carry ~500 words without inventing facts she didn't give.
+
+Caps:
+- Same theme as a recent post (list given) -> max 3.
+- Pure mood, logistics, or a to-do ("call the CM tomorrow") -> max 2.
+- Only a product plug with no idea behind it -> max 3.
 
 OUTPUT (JSON only):
 {
-  "verdict": "develop" | "hold" | "discard",
-  "confidence": 0-1,
-  "reason": "<one sentence, specific to this fragment>",
-  "core_claim": "<the one sentence version of the idea, if develop, else null>",
-  "topic_tags": ["<e.g. formulation, pricing, manufacturing, customer-behavior>"]
+  "score": <int 0-10>,
+  "pillar": "<one of the pillars above, or null>",
+  "reason": "<one sentence, specific to this note - why this score>",
+  "core_claim": "<the one-sentence version of the idea she's making, or null if there isn't one>",
+  "missing": "<if score is low: what she'd need to add to make it publishable, else null>",
+  "topic_tags": ["<short tags, e.g. niacinamide, ph, humidity, returns>"]
 }"""
 
 
 def triage_note(note_text, recent_topic_tags):
     user_content = (
-        f"Recent post topics (last 14 days): {', '.join(recent_topic_tags) or 'none'}\n"
-        f"Fragment:\n\"\"\"\n{note_text}\n\"\"\""
+        f"Recent post topics (last {config.RECENT_TOPICS_WINDOW_DAYS} days): "
+        f"{', '.join(recent_topic_tags) or 'none'}\n"
+        f"Note:\n\"\"\"\n{note_text}\n\"\"\""
     )
-    return _call_json(TRIAGE_SYSTEM, user_content, max_tokens=500)
+    return _call_json(TRIAGE_SYSTEM, user_content, max_tokens=600, temperature=0.1)
 
 
 QUERY_SYSTEM = """You generate search queries to find a current news item or industry data point \
 that could ground a LinkedIn post for a skincare founder. The post's core claim is given below. \
-You are not writing the post - only generating queries to feed into a search tool.
+You are not writing the post - only generating queries to feed into a news search tool.
 
 Generate 2-3 short queries that would surface:
-- Recent industry news (regulatory changes, ingredient bans/approvals, market reports)
+- Recent industry news (regulatory changes in India or globally, ingredient bans/approvals, \
+labelling rules, market reports)
 - Recent dermatology/cosmetic science research or studies
-- Competitor or category-level news (D2C skincare, clean beauty, "actives" trend coverage)
+- Category-level news (D2C skincare in India, clean beauty, "actives" trend coverage)
 
 Prefer queries that connect to the SPECIFIC mechanism/claim in the note, not generic "skincare news."
 
@@ -121,7 +150,7 @@ def generate_search_queries(core_claim, topic_tags, note_text):
     user_content = (
         f"Core claim: {core_claim}\n"
         f"Topic tags: {', '.join(topic_tags)}\n"
-        f"Original fragment (for extra context): \"\"\"{note_text}\"\"\""
+        f"Original note (for extra context): \"\"\"{note_text}\"\"\""
     )
     return _call_json(QUERY_SYSTEM, user_content, max_tokens=400)
 
@@ -171,46 +200,90 @@ def curate_reference(core_claim, date_window_days, today_date, search_results):
     return _call_json(CURATION_SYSTEM, user_content, max_tokens=500)
 
 
-DRAFT_SYSTEM = """You write LinkedIn post drafts for Meera Pillai in her voice - not as an AI, as \
-her. You are given the core idea to develop, examples of her actual published writing (voice \
-reference - match sentence rhythm, vocabulary, and how she opens/closes posts, don't imitate \
-topics), and possibly a current external reference to ground the post in the present.
+DRAFT_SYSTEM_TEMPLATE = """You are ghostwriting a LinkedIn post as Meera Pillai, founder of \
+Skinstinct. Write as her, in first person - the reader should not be able to tell it wasn't her.
 
-VOICE RULES (derived from her published work):
-- No wellness-industry filler ("glow up," "skin journey," "self-care"). Ever.
-- Leads with a specific, checkable claim - a number, a mechanism, a contradiction - not a hook \
-question.
-- Cites the "why" behind the claim (chemistry, clinical data, manufacturing reality), the way a \
-pharma-trained founder would, not a marketer.
-- Short paragraphs, plain declarative sentences. No hashtag stuffing, no emoji rows.
-- Ends by connecting the specific claim back to a customer-relevant decision (what to look for, \
-what to ignore) - not a call-to-action for engagement's sake.
+Follow this voice skill exactly. It was derived from everything she has published:
 
-TASK: Write ONE LinkedIn post (180-280 words) developing the core idea below. If a current \
-reference is given, weave it in naturally - as evidence or contrast, not tacked on. Do not invent \
-data, clinical claims, or statistics that weren't given to you; if the note lacks a specific \
-number, keep the claim qualitative rather than fabricating precision. This is a DRAFT for Meera \
-to review and edit - flag anywhere you had to infer or extrapolate rather than being given the \
-fact directly, in a separate "assumptions" field.
+{voice_skill}
+
+TASK
+- Develop the core idea from her note into ONE LinkedIn post of 400-550 words, 6-9 paragraphs, \
+paragraphs separated by a blank line.
+- Imitate the rhythm of her example posts (supplied by the user), not their topics, and not \
+their sentences - don't reuse her lines verbatim. The one exception is her recurring close \
+("...that is also useful information"), which is fine to echo.
+
+GROUNDING - she will stop using this tool the first time it puts words in her mouth:
+- Anything about Skinstinct - what it sells or doesn't sell, what it has tested, what it is \
+changing, plans, timelines, internal results, numbers - may ONLY come from her note. If the note \
+doesn't say it, don't write it. No invented commitments ("we are now testing at..."), no \
+"we don't currently sell X" unless the note says so.
+- No invented dates or times ("last month", "in April") unless the note or reference gives them.
+- General chemistry/industry mechanism is fine to explain, but keep numbers she didn't give out \
+of it, or hedge them the way she does ("typically around...").
+- If a current reference is given, use it the way she would - as one attributed piece of \
+evidence, not the headline. Describe its timing accurately from its publication date relative \
+to today (a report from five months ago is not "this month").
 
 OUTPUT (JSON only):
-{
+{{
   "draft": "<the full post text>",
-  "current_reference_used": "<one line on what you referenced and why it fit, or null>",
-  "assumptions": ["<anything you inferred rather than were told>"],
+  "current_reference_used": "<one line on what you referenced and where, or null>",
+  "assumptions": ["<each claim you supplied that wasn't in her note or the reference>"],
   "word_count": <int>
-}"""
+}}"""
 
 
-def draft_post(core_claim, note_text, published_examples, current_snippet):
-    voice_block = "\n\n---\n\n".join(published_examples) if published_examples else (
-        "(no voice samples on file yet - follow the voice rules above as closely as possible)"
+def _reference_block(reference, today_date):
+    if not reference:
+        return "(none - do not reference anything current or recent)"
+    return (
+        f"{reference.get('usable_snippet')}\n"
+        f"Source: {reference.get('source')} - \"{reference.get('headline')}\"\n"
+        f"Published: {reference.get('date')} (today is {today_date})"
     )
-    reference_block = current_snippet or "(none available - do not reference anything current)"
+
+
+def draft_post(core_claim, note_text, voice_skill, published_examples, reference, today_date):
+    examples_block = "\n\n=====\n\n".join(published_examples) if published_examples else "(none on file)"
     user_content = (
-        f"Core idea to develop: {core_claim}\n"
-        f"Original fragment: \"\"\"{note_text}\"\"\"\n\n"
-        f"Voice reference (her own writing - match style, not topic):\n{voice_block}\n\n"
-        f"Current reference to ground this in:\n{reference_block}"
+        f"HER PUBLISHED LINKEDIN POSTS (voice reference - match style, not topic):\n\n"
+        f"{examples_block}\n\n=====\n\n"
+        f"HER NOTE:\n\"\"\"{note_text}\"\"\"\n\n"
+        f"CORE IDEA TO DEVELOP: {core_claim}\n\n"
+        f"CURRENT REFERENCE:\n{_reference_block(reference, today_date)}"
     )
-    return _call_json(DRAFT_SYSTEM, user_content, max_tokens=1200)
+    system = DRAFT_SYSTEM_TEMPLATE.format(voice_skill=voice_skill or "(voice skill missing)")
+    return _call_json(system, user_content, max_tokens=3000, temperature=0.7)
+
+
+AUDIT_SYSTEM = """You fact-check a ghostwritten LinkedIn draft before the founder, Meera Pillai \
+of Skinstinct, reviews it. Her only sources are HER NOTE and the CURRENT REFERENCE. List every \
+claim in the draft that neither source supports, so she can verify or cut it before posting.
+
+Flag:
+- Anything about Skinstinct not stated in her note: products sold or not sold, tests run, \
+results, changes, plans, commitments, timelines. These matter most - prefix them "SKINSTINCT: ".
+- Specific numbers, dates, time references ("last month"), places, or study results not in \
+either source.
+- Anything attributed to the reference that the reference doesn't say, or a wrong description \
+of when it was published.
+
+Don't flag: her own opinions restated, general framing, or well-established textbook chemistry \
+stated without specific numbers.
+
+Quote or closely paraphrase the draft's wording in each item so she can find it. Most important \
+first. Empty list if everything is supported.
+
+OUTPUT (JSON only):
+{"unsupported": ["<claim> - <why it needs checking>"]}"""
+
+
+def audit_claims(note_text, reference, today_date, draft_text):
+    user_content = (
+        f"HER NOTE:\n\"\"\"{note_text}\"\"\"\n\n"
+        f"CURRENT REFERENCE:\n{_reference_block(reference, today_date)}\n\n"
+        f"DRAFT:\n\"\"\"{draft_text}\"\"\""
+    )
+    return _call_json(AUDIT_SYSTEM, user_content, max_tokens=1200, temperature=0.0)

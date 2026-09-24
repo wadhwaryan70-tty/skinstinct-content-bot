@@ -8,14 +8,16 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import requests
+import logging
+
 from flask import Flask, jsonify, request
 
 import config
 import pipeline
-from reply_format import format_reply
+from services import telegram
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 
 # Telegram retries a webhook delivery if it doesn't get a response quickly
 # enough, which this pipeline's multi-call AI chain can genuinely exceed -
@@ -41,19 +43,6 @@ def _already_seen(update_id):
     return False
 
 
-def _send_message(chat_id, text):
-    if not config.TELEGRAM_BOT_TOKEN:
-        return
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-            timeout=20,
-        )
-    except requests.RequestException:
-        pass
-
-
 @app.route("/api/webhook", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
@@ -64,13 +53,23 @@ def webhook():
         return jsonify({"ok": True})
 
     message = update.get("channel_post") or update.get("message")
-    if not message or "text" not in message:
+    if not message:
         return jsonify({"ok": True})
 
     chat_id = str(message.get("chat", {}).get("id", ""))
     if config.TELEGRAM_CHAT_ID and chat_id != config.TELEGRAM_CHAT_ID:
         return jsonify({"ok": True})
 
-    result = pipeline.process_note(message["text"])
-    _send_message(chat_id, format_reply(result))
+    # Always answer 200: any other status makes Telegram redeliver the same
+    # update, which would reprocess the note.
+    try:
+        note_text, source = telegram.note_from_message(message)
+        if note_text:
+            telegram.send_result(chat_id, pipeline.process_note(note_text), source)
+    except Exception:
+        logger.exception("Failed to process update %s", update.get("update_id"))
+        try:
+            telegram.send_result(chat_id, {"outcome": "error", "message": "couldn't process that note - check the logs"})
+        except Exception:
+            pass
     return jsonify({"ok": True})

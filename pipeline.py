@@ -1,14 +1,18 @@
-"""Trigger (Telegram message) -> Input (note) -> Context (voice + news) ->
-Processing/AI (triage, search, curate, draft) -> Output (draft back to Meera)."""
+"""Components map, left to right:
+Trigger (note dropped in Telegram) -> Input (text / transcribed voice) ->
+Processing (Gemini scores it 0-10, rejects low scores) -> Context (Google
+News hook via Serper) -> AI (Gemini drafts in Meera's voice skill) ->
+Output (draft sent to the Review Gate - Meera edits and publishes herself)."""
 from datetime import date
 
+import config
 import storage
-from services import llm, search
+from services import llm, search, style
 
 
 def process_note(note_text):
-    """Runs the full pipeline for one incoming note. Returns a dict describing
-    what happened, so the bot handler knows what to reply with."""
+    """Runs one note through the pipeline. Returns a dict describing what
+    happened, so the Telegram layer knows what to send back."""
     note = storage.add_note(note_text)
 
     try:
@@ -16,66 +20,91 @@ def process_note(note_text):
     except llm.LLMError as exc:
         return {"outcome": "error", "note": note, "message": f"Triage failed: {exc}"}
 
+    score = _as_score(triage.get("score"))
+    passed = score >= config.TRIAGE_SCORE_THRESHOLD and bool(triage.get("core_claim"))
     note_fields = dict(
-        status=triage.get("verdict", "hold"),
+        status="drafted" if passed else "rejected",
+        score=score,
+        pillar=triage.get("pillar"),
         core_claim=triage.get("core_claim"),
         topic_tags=triage.get("topic_tags") or [],
-        confidence=triage.get("confidence"),
         reason=triage.get("reason"),
+        missing=triage.get("missing"),
     )
     note.update(note_fields)
-    storage.update_note(
-        note["id"],
-        **note_fields,
-    )
+    storage.update_note(note["id"], **note_fields)
 
-    if triage.get("verdict") != "develop":
-        return {"outcome": triage.get("verdict", "hold"), "note": note, "triage": triage}
+    if not passed:
+        return {"outcome": "rejected", "note": note, "triage": triage}
 
-    return _develop(note, triage)
+    return _draft(note, triage)
 
 
-def _develop(note, triage):
-    core_claim = triage["core_claim"]
-    topic_tags = triage.get("topic_tags") or []
-
-    current_snippet = None
-    reference_meta = None
+def _as_score(value):
     try:
-        query_plan = llm.generate_search_queries(core_claim, topic_tags, note["text"])
-        raw_results = search.search_news_multi(
-            query_plan.get("queries") or [], num_per_query=6
+        return max(0, min(10, int(value)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _find_news_hook(note, triage):
+    """Context step. Returns the curated reference, or None - a missing hook
+    is never fatal, Meera would rather get a draft without one than no draft."""
+    try:
+        query_plan = llm.generate_search_queries(
+            triage["core_claim"], triage.get("topic_tags") or [], note["text"]
         )
-        if raw_results:
-            curated = llm.curate_reference(
-                core_claim,
-                query_plan.get("date_window_days", 30),
-                date.today().isoformat(),
-                raw_results,
-            )
-            if curated.get("available") and curated.get("selected"):
-                reference_meta = curated["selected"]
-                current_snippet = reference_meta.get("usable_snippet")
+        raw_results = search.search_news_multi(query_plan.get("queries") or [], num_per_query=6)
+        if not raw_results:
+            return None
+        curated = llm.curate_reference(
+            triage["core_claim"],
+            query_plan.get("date_window_days", 30),
+            date.today().isoformat(),
+            raw_results,
+        )
     except llm.LLMError:
-        # A missing news hook is not fatal - Meera would rather get a draft
-        # without one than no draft at all.
-        pass
+        return None
+    if curated.get("available") and curated.get("selected"):
+        return curated["selected"]
+    return None
 
-    voice_examples = storage.load_voice_examples()
+
+def _draft(note, triage):
+    reference = _find_news_hook(note, triage)
+    today = date.today().isoformat()
 
     try:
-        drafted = llm.draft_post(core_claim, note["text"], voice_examples, current_snippet)
+        drafted = llm.draft_post(
+            triage["core_claim"],
+            note["text"],
+            storage.load_voice_skill(),
+            storage.load_voice_examples(),
+            reference,
+            today,
+        )
     except llm.LLMError as exc:
         return {"outcome": "error", "note": note, "message": f"Draft failed: {exc}"}
 
+    draft_text = style.to_meera_style((drafted.get("draft") or "").strip())
     draft = storage.add_draft({
         "note_id": note["id"],
-        "core_claim": core_claim,
-        "draft": drafted.get("draft", ""),
+        "core_claim": triage["core_claim"],
+        "draft": draft_text,
         "current_reference_used": drafted.get("current_reference_used"),
-        "reference_meta": reference_meta,
-        "assumptions": drafted.get("assumptions") or [],
-        "word_count": drafted.get("word_count"),
+        "reference_meta": reference,
+        "assumptions": _audit(note["text"], reference, today, draft_text, drafted),
+        "word_count": len(draft_text.split()),
     })
 
-    return {"outcome": "develop", "note": note, "triage": triage, "draft": draft}
+    return {"outcome": "drafted", "note": note, "triage": triage, "draft": draft}
+
+
+def _audit(note_text, reference, today, draft_text, drafted):
+    """The drafter under-reports its own inventions, so a separate pass checks
+    every claim against the note and reference. Falls back to the drafter's
+    self-reported list if the audit call fails."""
+    try:
+        return llm.audit_claims(note_text, reference, today, draft_text).get("unsupported") or []
+    except llm.LLMError:
+        return drafted.get("assumptions") or []

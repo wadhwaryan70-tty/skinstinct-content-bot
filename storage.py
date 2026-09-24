@@ -36,11 +36,13 @@ def add_note(text):
         "id": uuid.uuid4().hex[:12],
         "text": text,
         "timestamp": _now_iso(),
-        "status": "pending",  # pending | develop | hold | discard
+        "status": "pending",  # pending | drafted | rejected
+        "score": None,
+        "pillar": None,
         "core_claim": None,
         "topic_tags": [],
-        "confidence": None,
         "reason": None,
+        "missing": None,
     }
     notes.append(note)
     _save(config.NOTES_FILE, notes)
@@ -57,13 +59,13 @@ def update_note(note_id, **fields):
 
 
 def recent_topics(window_days=None):
-    """Topic tags from notes marked 'develop' in the last N days, for the
-    triage step's dedupe check."""
+    """Topic tags from notes drafted in the last N days, for the triage
+    step's dedupe check."""
     window_days = window_days or config.RECENT_TOPICS_WINDOW_DAYS
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
     tags = []
     for note in load_notes():
-        if note.get("status") != "develop":
+        if note.get("status") != "drafted":
             continue
         try:
             ts = datetime.fromisoformat(note["timestamp"])
@@ -90,12 +92,18 @@ def add_draft(draft):
 
 # --- voice reference ---
 
+def load_voice_skill():
+    if not config.VOICE_SKILL_FILE.exists():
+        return ""
+    return config.VOICE_SKILL_FILE.read_text(encoding="utf-8").strip()
+
+
 def load_voice_examples(max_n=None):
+    """Her LinkedIn posts only - same format as the output. The newsletters
+    informed the voice skill but would bloat every draft call."""
     max_n = max_n or config.MAX_VOICE_EXAMPLES
-    if not config.VOICE_REFERENCE_DIR.exists():
-        return []
     examples = []
-    for path in sorted(config.VOICE_REFERENCE_DIR.glob("*.txt")):
+    for path in sorted(config.VOICE_REFERENCE_DIR.glob("linkedin_post_*.txt")):
         text = path.read_text(encoding="utf-8").strip()
         if text:
             examples.append(text)

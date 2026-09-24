@@ -3,7 +3,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 
 def _clean(value):
@@ -27,7 +27,11 @@ DATA_DIR = Path("/tmp/skinstinct_data") if IS_SERVERLESS else BASE_DIR / "data"
 NOTES_FILE = DATA_DIR / "notes.json"
 DRAFTS_FILE = DATA_DIR / "drafts.json"
 VOICE_REFERENCE_DIR = BASE_DIR / "voice_reference"
+VOICE_SKILL_FILE = VOICE_REFERENCE_DIR / "meera_voice_skill.md"
 
+# Triage scores notes 0-10; below this they're rejected with a reason
+# instead of drafted.
+TRIAGE_SCORE_THRESHOLD = 6
 RECENT_TOPICS_WINDOW_DAYS = 14
 MAX_VOICE_EXAMPLES = 4
 SEARCH_RESULTS_PER_QUERY = 8

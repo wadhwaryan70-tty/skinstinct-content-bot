@@ -1,27 +1,37 @@
 # Skinstinct content bot
 
-Meera keeps dropping notes into a Telegram channel. This bot reads each note,
-decides if it's worth developing, finds a current news/data point to ground
-it in, drafts a LinkedIn post in her voice, and replies in the same channel
-with the draft for her to review. It never posts anywhere on its own.
+Meera keeps dropping notes - typed or voice - into a Telegram channel. This
+bot transcribes voice notes, scores each note 0-10 for publishability,
+rejects the weak ones with a reason, finds a current industry news hook for
+the rest, drafts a LinkedIn post in her voice, fact-checks the draft against
+her note, and sends it back to the channel for her to review. It never
+publishes anything on its own.
 
 ## Components map
 
-```
-Trigger     Telegram message posted in Meera's channel
-Input       The raw note text
-Context     Recent post topics (dedupe) + her published voice samples +
-            live news search results
-Processing  Query generation, news search (Serper), result curation
-AI          Gemini: triage -> generate search queries -> curate reference
-            -> draft the post
-Output      A reply in the same Telegram channel: either the draft (with
-            assumptions + source flagged), or a short "noted"/"skipping" ack
-```
+| Actor | Step | What happens | Code |
+|---|---|---|---|
+| Meera (Founder) | Trigger | Drops a voice note or text note into Telegram | - |
+| Telegram | Input | Receives the note; voice notes are transcribed to text (Gemini audio - the Bot API doesn't expose Telegram's own transcription) | `services/telegram.py` `note_from_message` |
+| Gemini API (Triage) | Processing | Scores the note 0-10 (specificity, point of view, pillar fit, enough to build on); below 6 is rejected with what's missing | `services/llm.py` `triage_note` |
+| Google News (Context) | Context | Gemini writes news queries, Serper's Google News endpoint fetches results, Gemini picks one credible, recent hook or none | `pipeline.py` `_find_news_hook` |
+| Gemini API | AI | Drafts the post using Meera's voice skill + her 4 LinkedIn posts as examples; a second pass audits every claim against her note | `services/llm.py` `draft_post`, `audit_claims` |
+| Review Gate (Meera) | Output | Review card (score, hook, claims to check) + the draft with a "Post on LinkedIn" button that opens the composer pre-filled; she edits and publishes | `services/telegram.py` `send_result` |
 
 The Cut: this does not auto-publish to LinkedIn. Meera wants a draft ready to
-*look at* - a human approval step is not optional here, so posting stays
-manual by design, not a missing feature.
+*look at* - the review gate is the product, not a missing feature. The
+button only pre-fills LinkedIn's composer; nothing is posted until she posts.
+
+## Meera's voice
+
+`voice_reference/` holds her 15 published pieces from the case seed data and
+`meera_voice_skill.md`, the style rules distilled from them. Each draft gets
+the skill as its style guide and her 4 LinkedIn posts as examples. Mechanical
+rules the model ignores under pressure (British spelling, no em dashes) are
+enforced in `services/style.py` instead of the prompt. The claims audit
+exists because the drafter under-reports its own inventions - specifically
+anything about Skinstinct she didn't say, which is the failure that ended
+her content-writer experiment.
 
 ## Setup
 
@@ -99,16 +109,18 @@ curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/deleteWebhook"
 config.py              Env vars, paths, constants
 storage.py              Flat-file JSON storage for notes and drafts
 services/
-  llm.py                The three Gemini prompts: triage, query generation +
-                        reference curation, draft
-  search.py             Serper news search wrapper
-pipeline.py             Orchestrates trigger -> ... -> output for one note
-reply_format.py         Turns a pipeline result into the reply text (shared)
+  llm.py                Gemini calls: transcribe, triage score, news queries,
+                        hook curation, draft, claims audit
+  search.py             Serper (Google News) search wrapper
+  telegram.py           Telegram I/O: note intake (incl. voice) + Review Gate
+  style.py              Enforces British spelling / no em dashes on drafts
+pipeline.py             Orchestrates one note through the components map
 bot.py                  Local dev entrypoint: long-polling handler
 main.py                 Local dev entrypoint
 api/webhook.py          Vercel entrypoint: webhook handler (Flask/WSGI)
 vercel.json             Vercel function config (maxDuration)
-voice_reference/        Meera's own writing, used as few-shot voice examples
+pyproject.toml          Vercel Python build: deps + entrypoint
+voice_reference/        Meera's 15 published pieces + meera_voice_skill.md
 data/                   notes.json, drafts.json (created on first run, local only)
 ```
 

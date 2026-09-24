@@ -1,10 +1,10 @@
-Drop Meera's own writing here as plain `.txt` files (one piece per file) -
-her 4 LinkedIn posts and however many of the 11 newsletters read as close to
-LinkedIn voice. These are used as few-shot voice examples in the draft step,
-verbatim - not summarized, not paraphrased.
+Meera's own writing, from the case seed data ("published/" - 4 LinkedIn posts
+and 11 newsletters), one piece per `.txt` file.
 
-If this folder is empty, the bot still works: it falls back to the voice
-rules written into the draft prompt, but matching will be looser without her
-actual sentences to imitate.
-
-Up to 4 examples are used per draft (see `MAX_VOICE_EXAMPLES` in `config.py`).
+- `meera_voice_skill.md` - the voice skill: rules distilled from all 15
+  pieces. Loaded into the draft prompt as the system-level style guide.
+- `linkedin_post_*.txt` - passed to the drafter verbatim as few-shot
+  examples (the first `MAX_VOICE_EXAMPLES` files in sort order, which are the
+  four LinkedIn posts - same format as the output).
+- `newsletter_*.txt` - kept as source material for the skill; not sent on
+  every draft call, to keep prompts lean.
